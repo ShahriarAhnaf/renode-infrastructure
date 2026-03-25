@@ -52,7 +52,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             bool irq = (lfclkEventGenerated.Value && lfclkStartedEventEnabled.Value)
                     || (lfclkCalibrationEventGenerated.Value && lfclkCalibrationEventEnabled.Value)
                     || (hfclkEventGenerated.Value && hfclkStartedEventEnabled.Value)
-                    || (hfclk192mStartedEventEnabled.Value && hfclk192mStarted);
+                    || (hfclk192mStartedEventEnabled.Value && hfclk192mStarted)
+                    || (calibrationTimerTimeoutEvent.Value && calibrationTimerTimeoutEventEnabled.Value);
             this.Log(LogLevel.Noisy, "Setting IRQ: {0}", irq);
             IRQ.Set(irq);
         }
@@ -63,6 +64,14 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 .WithFlag(0, out hfclkEventGenerated, name: "EVENTS_HFCLKSTARTED")
                 .WithReservedBits(1, 31)
                 .WithWriteCallback((_, __) => Update());
+
+            Registers.HFCLKStartTriggered.Define(this)
+                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => hfclkStarted, name: "TRIGGERED")
+                .WithReservedBits(1, 31);
+
+            Registers.LFCLKStartTriggered.Define(this)
+                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => lfclkStarted, name: "TRIGGERED")
+                .WithReservedBits(1, 31);
 
             Registers.LFCLKStarted.Define(this)
                 .WithFlag(0, out lfclkEventGenerated, name: "EVENTS_LFCLKSTARTED")
@@ -105,23 +114,48 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 .WithReservedBits(1, 31);
 
             Registers.CalibrationOfLFRCCompleted.Define(this)
-                .WithFlag(0, out lfclkCalibrationEventGenerated, name: "EVENTS_HFCLKSTARTED")
+                .WithFlag(0, out lfclkCalibrationEventGenerated, name: "EVENTS_DONE")
                 .WithReservedBits(1, 31)
                 .WithWriteCallback((_, __) => Update());
+
+            Registers.CalibrationTimerTimeout.Define(this)
+                .WithFlag(0, out calibrationTimerTimeoutEvent, name: "EVENTS_CTTO")
+                .WithReservedBits(1, 31)
+                .WithWriteCallback((_, __) => Update());
+
+            Registers.CalibrationTimerStarted.Define(this)
+                .WithFlag(0, name: "EVENTS_CTSTARTED")
+                .WithReservedBits(1, 31);
+
+            Registers.CalibrationTimerStopped.Define(this)
+                .WithFlag(0, name: "EVENTS_CTSTOPPED")
+                .WithReservedBits(1, 31);
 
             Registers.StartLFRCCallibration.Define(this)
                 .WithFlag(0, FieldMode.Write, writeCallback: (_, value) =>
                 {
                     lfclkCalibrationEventGenerated.Value = true;
                     Update();
-                }).WithReservedBits(1, 31);
+                }, name: "TASKS_CAL")
+                .WithReservedBits(1, 31);
+
+            Registers.StartCallibrationTimer.Define(this)
+                .WithFlag(0, FieldMode.Write, writeCallback: (_, value) =>
+                {
+                    // Immediately fire EVENTS_CTTO — we don't simulate real
+                    // clock drift, so instant completion is correct.
+                    calibrationTimerTimeoutEvent.Value = true;
+                    Update();
+                }, name: "TASKS_CTSTART")
+                .WithReservedBits(1, 31);
 
             Registers.StopCallibrationTimer.Define(this)
                 .WithFlag(0, FieldMode.Write, writeCallback: (_, value) =>
                 {
-                    lfclkCalibrationEventGenerated.Value = false;
+                    calibrationTimerTimeoutEvent.Value = false;
                     Update();
-                }).WithReservedBits(1, 31);
+                }, name: "TASKS_CTSTOP")
+                .WithReservedBits(1, 31);
 
             Registers.PowerUsbRegisterStatus.Define(this)
                 .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => true, name: "VBUSDETECT")
@@ -154,7 +188,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 .WithFlag(1, out lfclkStartedEventEnabled, FieldMode.Read | FieldMode.Set, name: "LFCLKSTARTED")
                 .WithReservedBits(2, 1)
                 .WithFlag(3, out lfclkCalibrationEventEnabled, FieldMode.Read | FieldMode.Set, name: "DONE")
-                .WithTaggedFlag("CTTO", 4)
+                .WithFlag(4, out calibrationTimerTimeoutEventEnabled, FieldMode.Read | FieldMode.Set, name: "CTTO")
                 .WithReservedBits(5, 2)
                 .WithTaggedFlag("DONE (nRF5340)", 7) // nRF5340, but also nRF52840 USB
                 .WithFlag(8, out hfclk192mAudioStartedEventEnabled, FieldMode.Read | FieldMode.Set, name: "HFCLKAUDIOSTARTED") // nRF5340, but also nRF52840 with USB
@@ -175,7 +209,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 .WithFlag(3,
                     writeCallback: (_, value) => lfclkCalibrationEventEnabled.Value &= !value,
                     valueProviderCallback: _ => lfclkCalibrationEventEnabled.Value, name: "DONE")
-                .WithTaggedFlag("CTTO", 4)
+                .WithFlag(4,
+                    writeCallback: (_, value) => calibrationTimerTimeoutEventEnabled.Value &= !value,
+                    valueProviderCallback: _ => calibrationTimerTimeoutEventEnabled.Value, name: "CTTO")
                 .WithReservedBits(5, 2)
                 .WithTaggedFlag("DONE (nRF540)", 7) // nRF5340, but also nRF52840 USB
                 .WithFlag(8,
@@ -190,11 +226,19 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                 .WithWriteCallback((_, __) => Update());
 
             Registers.LFCLKClockSource.Define(this)
-                .WithValueField(0, 2, out var lfclkSource, name: "SRC")
+                .WithValueField(0, 2, out lfclkSource, name: "SRC")
                 .WithReservedBits(2, 14)
                 .WithFlag(16, name: "BYPASS")
                 .WithFlag(17, name: "EXTERNAL")
                 .WithReservedBits(18, 14);
+
+            Registers.LFCLKClockSourceCopy.Define(this)
+                .WithValueField(0, 2, FieldMode.Read, valueProviderCallback: _ => lfclkSource.Value, name: "SRC")
+                .WithReservedBits(2, 30);
+
+            Registers.CallibrationTimerInterval.Define(this)
+                .WithValueField(0, 7, name: "CTIV")
+                .WithReservedBits(7, 25);
 
             Registers.HFCLKStatus.Define(this)
                 // true in the first bit indicates that hfclk is started. Not sure if it's possible to return true in STATE and false in SRC
@@ -225,6 +269,9 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private IFlagRegisterField hfclk192mAudioStartedEventEnabled;
         private IFlagRegisterField lfclkCalibrationEventEnabled;
         private IFlagRegisterField lfclkCalibrationEventGenerated;
+        private IFlagRegisterField calibrationTimerTimeoutEvent;
+        private IFlagRegisterField calibrationTimerTimeoutEventEnabled;
+        private IValueRegisterField lfclkSource;
 
         private enum Registers
         {
