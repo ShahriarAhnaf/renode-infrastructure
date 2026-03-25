@@ -127,6 +127,9 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
             DefineTask(Registers.Disable, Disable, "TASKS_DISABLE");
 
+            DefineTask(Registers.CCAStart, CCAStart, "TASKS_CCASTART");
+            DefineTask(Registers.CCAStop, () => { }, "TASKS_CCASTOP");
+
             DefineEvent(Registers.Ready, () => this.Log(LogLevel.Error, "Trying to trigger READY event, not supported"), Events.Ready, "EVENTS_READY");
             DefineEvent(Registers.AddressSentOrReceived, () => this.Log(LogLevel.Error, "Trying to trigger ADDRESS event, not supported"), Events.Address, "EVENTS_ADDRESS");
             DefineEvent(Registers.PayloadSentOrReceived, () => this.Log(LogLevel.Error, "Trying to trigger PAYLOAD event, not supported"), Events.Payload, "EVENTS_PAYLOAD");
@@ -134,6 +137,9 @@ namespace Antmicro.Renode.Peripherals.Wireless
             DefineEvent(Registers.BitCounterMatch, () => this.Log(LogLevel.Error, "Trying to trigger BCMATCH event, not supported"), Events.BitCountMatch, "EVENTS_BCMATCH");
             DefineEvent(Registers.RSSIEnd, () => this.Log(LogLevel.Error, "Trying to trigger RSSIEnd event, not supported"), Events.RSSIEnd, "EVENTS_RSSIEND");
             DefineEvent(Registers.CRCOk, () => this.Log(LogLevel.Error, "Trying to trigger CRCOk event, not supported"), Events.CRCOk, "EVENTS_CRCOK");
+
+            DefineEvent(Registers.DeviceMatch, () => {}, Events.DeviceAddressMatch, "EVENTS_DEVMATCH");
+            DefineEvent(Registers.DeviceMiss, () => {}, Events.DeviceAddressMiss, "EVENTS_DEVMISS");
 
             DefineEvent(Registers.RadioDisabled, Disable, Events.Disabled, "EVENTS_DISABLED");
 
@@ -173,8 +179,28 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 interruptManager.GetInterruptEnableClearRegister<DoubleWordRegister>());
 
             Registers.CRCStatus.Define(this)
-               .WithFlag(0, name: "CRCSTATUS", valueProviderCallback: _ => true) // we assume here that CRCs are always ok
+               .WithFlag(0, name: "CRCSTATUS", valueProviderCallback: _ => true)
                .WithReservedBits(1, 31)
+            ;
+
+            Registers.RxMatch.Define(this, name: "RXMATCH")
+                .WithValueField(0, 3, FieldMode.Read, name: "RXMATCH")
+                .WithReservedBits(3, 29)
+            ;
+
+            Registers.RxCRC.Define(this, name: "RXCRC")
+                .WithValueField(0, 24, FieldMode.Read, name: "RXCRC")
+                .WithReservedBits(24, 8)
+            ;
+
+            Registers.DeviceAddressMatchIndex.Define(this, name: "DAI")
+                .WithValueField(0, 3, FieldMode.Read, name: "DAI")
+                .WithReservedBits(3, 29)
+            ;
+
+            Registers.PayloadStatus.Define(this, name: "PDUSTAT")
+                .WithValueField(0, 1, FieldMode.Read, name: "PDUSTAT")
+                .WithReservedBits(1, 31)
             ;
 
             Registers.PacketPointer.Define(this)
@@ -279,11 +305,55 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 .WithValueField(0, 32, out bitCountCompare)
             ;
 
+            for(var i = 0; i < 8; i++)
+            {
+                ((Registers)((int)Registers.DeviceAddressBaseSegment0 + i * 4)).Define(this, name: $"DAB[{i}]")
+                    .WithValueField(0, 32, name: $"DAB{i}")
+                ;
+            }
+
+            for(var i = 0; i < 8; i++)
+            {
+                ((Registers)((int)Registers.DeviceAddressPrefix0 + i * 4)).Define(this, name: $"DAP[{i}]")
+                    .WithValueField(0, 16, name: $"DAP{i}")
+                    .WithReservedBits(16, 16)
+                ;
+            }
+
+            Registers.DeviceAddressMatchConfiguration.Define(this, name: "DACNF")
+                .WithFlags(0, 8, name: "ENA")
+                .WithFlags(8, 8, name: "TXADD")
+                .WithReservedBits(16, 16)
+            ;
+
+            Registers.SearchPatternConfiguration.Define(this, name: "MHRMATCHCONF")
+                .WithValueField(0, 32, name: "MHRMATCHCONF")
+            ;
+
+            Registers.PatternMask.Define(this, name: "MHRMATCHMAS")
+                .WithValueField(0, 32, name: "MHRMATCHMAS")
+            ;
+
             Registers.ModeConfiguration0.Define(this, 0x200)
-                .WithTaggedFlag("RU", 0)
+                .WithFlag(0, out fastRampUp, name: "RU")
                 .WithReservedBits(1, 7)
                 .WithTag("DTX", 8, 2)
                 .WithReservedBits(10, 22)
+            ;
+
+            Registers.StartOfFrameDelimiter.Define(this, name: "SFD")
+                .WithValueField(0, 8, name: "SFD")
+                .WithReservedBits(8, 24)
+            ;
+
+            Registers.EnergyDetectLoopCount.Define(this, name: "EDCNT")
+                .WithValueField(0, 21, name: "EDCNT")
+                .WithReservedBits(21, 11)
+            ;
+
+            Registers.EnergyDetectLevel.Define(this, name: "EDSAMPLE")
+                .WithValueField(0, 8, FieldMode.Read, name: "EDLVL")
+                .WithReservedBits(8, 24)
             ;
 
             Registers.CCAControl.Define(this, 0x052D0000, name: "CCACTRL")
@@ -292,6 +362,22 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 .WithTag("CCAEDTHRES", 8, 8)
                 .WithTag("CCACORRTHRES", 16, 8)
                 .WithTag("CCACORRCNT", 24, 8)
+            ;
+
+            Registers.MHRMatchConf.Define(this, name: "MHRMATCHCONF")
+                .WithValueField(0, 32, name: "MHRMATCHCONF")
+            ;
+
+            Registers.MHRMatchMas.Define(this, name: "MHRMATCHMAS")
+                .WithValueField(0, 32, name: "MHRMATCHMAS")
+            ;
+
+            Registers.Undocumented77C.Define(this, name: "UNDOC_77C")
+                .WithValueField(0, 32, name: "UNDOC_77C")
+            ;
+
+            Registers.Undocumented788.Define(this, name: "UNDOC_788")
+                .WithValueField(0, 32, name: "UNDOC_788")
             ;
 
             Registers.PowerControl.Define(this, 1, name: "POWER")
@@ -316,13 +402,40 @@ namespace Antmicro.Renode.Peripherals.Wireless
             EventTriggered?.Invoke((uint)@event * 4 + 0x100);
         }
 
+        private void ScheduleDisable()
+        {
+            // Spec PS pg 49: EVENTS_DISABLED has ~0.25µs jitter relative to EVENTS_END.
+            // Firing them at the same virtual timestamp breaks SW-TIFS: Zephyr's LL uses
+            // PPI to capture TIMER0 on EVENTS_END, then programs TXEN/RXEN at END+110µs.
+            // If DISABLED fires simultaneously, PPI-triggered tasks execute in the same
+            // quantum and corrupt the TIMER0 reference used for drift compensation.
+            // We use 1µs to stay above Renode's quantum boundary while remaining spec-faithful.
+            var ts = machine.LocalTimeSource;
+            var disabledStamp = new TimeStamp(ts.ElapsedVirtualTime + TimeInterval.FromMicroseconds(1), ts.Domain);
+            ts.ExecuteInSyncedState(_ => Disable(), disabledStamp);
+        }
+
         private void Disable()
         {
             radioState = State.Disabled;
             SetEvent(Events.Disabled);
-            LogUnhandledShort(shorts.DisabledRSSIStop, nameof(shorts.DisabledRSSIStop));
-            LogUnhandledShort(shorts.DisabledRxEnable, nameof(shorts.DisabledRxEnable));
-            LogUnhandledShort(shorts.DisabledTxEnable, nameof(shorts.DisabledTxEnable));
+
+            if(shorts.DisabledTxEnable.Value)
+            {
+                TxEnable();
+                return;
+            }
+            if(shorts.DisabledRxEnable.Value)
+            {
+                RxEnable();
+                return;
+            }
+
+            // DISABLED_RSSISTOP is a no-op here: RSSI sampling itself is
+            // not modeled, so there is no sampler to stop. Zephyr's LL
+            // sets this short during initiator-scan; logging it as ERROR
+            // (the previous behavior) made the connection state machine
+            // appear broken even though the short was semantically harmless.
         }
 
         // These comments sum up some details gathered from the documentation.
@@ -354,32 +467,56 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
         private void TxEnable()
         {
-            radioState = State.TxIdle;
-            // we're skipping rampup, it's instant
-
-            SetEvent(Events.Ready);
-            SetEvent(Events.TxReady);
-
-            if(shorts.ReadyStart.Value || shorts.TxReadyStart.Value)
+            radioState = State.TxRampup;
+            var ts = machine.LocalTimeSource;
+            // Spec PS pg 49: TXEN→READY = 40µs (fast ramp-up, MODECNF0.RU=1) or 140µs (default)
+            var rampUp = fastRampUp.Value ? RampUpFastMicroseconds : RampUpDefaultMicroseconds;
+            var readyStamp = new TimeStamp(ts.ElapsedVirtualTime + TimeInterval.FromMicroseconds(rampUp), ts.Domain);
+            ts.ExecuteInSyncedState(_ =>
             {
-                Start();
-            }
-            LogUnhandledShort(shorts.ReadyEnergyDetectStart, nameof(shorts.ReadyEnergyDetectStart));
+                radioState = State.TxIdle;
+                SetEvent(Events.Ready);
+                SetEvent(Events.TxReady);
+                if(shorts.ReadyStart.Value || shorts.TxReadyStart.Value)
+                {
+                    Start();
+                }
+                LogUnhandledShort(shorts.ReadyEnergyDetectStart, nameof(shorts.ReadyEnergyDetectStart));
+            }, readyStamp);
         }
 
         private void RxEnable()
         {
-            radioState = State.RxIdle;
-            // we're skipping rampup, it's instant
-
-            SetEvent(Events.Ready);
-            SetEvent(Events.RxReady);
-
-            if(shorts.ReadyStart.Value || shorts.RxReadyStart.Value)
+            radioState = State.RxRampup;
+            var ts = machine.LocalTimeSource;
+            // Spec PS pg 49: RXEN→READY = 40µs (fast ramp-up, MODECNF0.RU=1) or 140µs (default)
+            var rampUp = fastRampUp.Value ? RampUpFastMicroseconds : RampUpDefaultMicroseconds;
+            var readyStamp = new TimeStamp(ts.ElapsedVirtualTime + TimeInterval.FromMicroseconds(rampUp), ts.Domain);
+            ts.ExecuteInSyncedState(_ =>
             {
-                Start();
+                radioState = State.RxIdle;
+                SetEvent(Events.Ready);
+                SetEvent(Events.RxReady);
+                if(shorts.ReadyStart.Value || shorts.RxReadyStart.Value)
+                {
+                    Start();
+                }
+                else if(shorts.RxReadyCCAStart.Value)
+                {
+                    CCAStart();
+                }
+                LogUnhandledShort(shorts.ReadyEnergyDetectStart, nameof(shorts.ReadyEnergyDetectStart));
+            }, readyStamp);
+        }
+
+        private void CCAStart()
+        {
+            SetEvent(Events.CCAIdle);
+
+            if(shorts.CCAIdleTxEnable.Value)
+            {
+                TxEnable();
             }
-            LogUnhandledShort(shorts.ReadyEnergyDetectStart, nameof(shorts.ReadyEnergyDetectStart));
         }
 
         private void Start()
@@ -448,7 +585,6 @@ namespace Antmicro.Renode.Peripherals.Wireless
             var crcLen = 4;
             ScheduleRadioEvents((uint)(headerLengthInAir + payloadLength + crcLen));
 
-            LogUnhandledShort(shorts.EndStart, nameof(shorts.EndStart)); // not sure how to support it. It's instant from our perspective.
         }
 
         private void ScheduleRadioEvents(uint packetLen)
@@ -467,9 +603,6 @@ namespace Antmicro.Renode.Peripherals.Wireless
             // End event
             var endTime = now + TimeInterval.FromMicroseconds((uint)(packetLen) * 8);
             var endTimeStamp = new TimeStamp(endTime, timeSource.Domain);
-
-            var disableTime = endTime + TimeInterval.FromMicroseconds(10);
-            var disableTimeStamp = new TimeStamp(disableTime, timeSource.Domain);
 
             // Address modelled as happening immediatley and serves as anchor
             // point for other events. RIOT triggers IRQ from it.
@@ -495,24 +628,26 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 }, bcMatchTimeStamp);
             }
 
-            // Schedule "end" events all at once, simulating the transmision time
-            // as 8 microseconds-per-byte. Timing distinction between events here doesn't
-            // seem important
+            // Schedule "end" events, simulating transmission time as 8µs/byte (1M PHY).
+            // END and DISABLED are separated: Zephyr's SW-TIFS captures TIMER0 on
+            // EVENTS_END via PPI and relies on DISABLED arriving ~1µs later so the
+            // capture timestamp is clean before shortcuts fire.
             timeSource.ExecuteInSyncedState(_ =>
             {
                 SetEvent(Events.Payload);
                 SetEvent(Events.End);
                 SetEvent(Events.CRCOk);
-            }, endTimeStamp);
 
-            // BLE stacks use disabled event as common processing trigger.
-            timeSource.ExecuteInSyncedState(_ =>
-            {
+                if(shorts.EndStart.Value)
+                {
+                    Start();
+                }
+
                 if(shorts.EndDisable.Value)
                 {
-                    Disable();
+                    ScheduleDisable();
                 }
-            }, disableTimeStamp);
+            }, endTimeStamp);
         }
 
         private void FillCurrentAddress(byte[] data, int startIndex, uint logicalAddress)
@@ -562,6 +697,7 @@ namespace Antmicro.Renode.Peripherals.Wireless
         private IFlagRegisterField frequencyMap;
         private IValueRegisterField frequency;
         private IValueRegisterField packetPointer;
+        private IFlagRegisterField fastRampUp;
 
         private readonly IFlagRegisterField[] events;
         private readonly InterruptManager<Events> interruptManager;
@@ -613,6 +749,10 @@ namespace Antmicro.Renode.Peripherals.Wireless
         };
 
         private const int DefaultRSSISample = 10;
+
+        // Spec PS pg 49: TXEN/RXEN → READY ramp-up times
+        private const uint RampUpFastMicroseconds = 40;    // MODECNF0.RU=1 (fast)
+        private const uint RampUpDefaultMicroseconds = 140; // MODECNF0.RU=0 (default, reset value=0x200 means DTX=center, RU=0)
 
         private struct Shorts
         {
@@ -783,6 +923,13 @@ namespace Antmicro.Renode.Peripherals.Wireless
             EnergyDetectLoopCount = 0x664,
             EnergyDetectLevel = 0x668,
             CCAControl = 0x66C,
+            // Undocumented registers accessed by SoftDevice blob
+            EdCnt = 0x670,
+            EdSample = 0x674,
+            MHRMatchConf = 0x73C,
+            MHRMatchMas = 0x740,
+            Undocumented77C = 0x77C,
+            Undocumented788 = 0x788,
             PowerControl = 0xFFC
         }
     }
