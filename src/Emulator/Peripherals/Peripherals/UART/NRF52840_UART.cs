@@ -385,6 +385,7 @@ namespace Antmicro.Renode.Peripherals.UART
             case Baudrate.Baud460800: return 460800;
             case Baudrate.Baud921600: return 921600;
             case Baudrate.Baud1M: return 1000000;
+            case Baudrate.Baud2M: return 2000000;
             default: return 0;
             }
         }
@@ -485,7 +486,8 @@ namespace Antmicro.Renode.Peripherals.UART
             Baud250000 = 0x04000000,
             Baud460800 = 0x075F7000,
             Baud921600 = 0x0EBED000,
-            Baud1M = 0x10000000
+            Baud1M = 0x10000000,
+            Baud2M = 0x20000000
         }
 
         private enum ParityConfig
