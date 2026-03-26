@@ -21,6 +21,7 @@ namespace Antmicro.Renode.Peripherals.I2C
     {
         public NRF52840_I2C(IMachine machine) : base(machine)
         {
+            this.machine = machine;
             IRQ = new GPIO();
 
             slaveToMasterBuffer = new Queue<byte>();
@@ -37,7 +38,11 @@ namespace Antmicro.Renode.Peripherals.I2C
 
             selectedSlave = null;
             enabled = false;
+            twimMode = false;
             transmissionInProgress = false;
+            legacySuspended = false;
+            rxAmount = 0;
+            txAmount = 0;
 
             RegistersCollection.Reset();
             UpdateInterrupts();
@@ -70,12 +75,30 @@ namespace Antmicro.Renode.Peripherals.I2C
                     }
 
                     transmissionInProgress = true;
-                    // send what is buffered as this might be a repeated start condition
-                    TrySendDataToSlave();
-                    // prepare to receive data from slave
-                    slaveToMasterBuffer.Clear();
-                    // try read the response
-                    TryFillReceivedBuffer(true);
+                    legacySuspended = false;
+
+                    if(twimMode)
+                    {
+                        PerformTwimReceive();
+                    }
+                    else
+                    {
+                        if(selectedSlave == null)
+                        {
+                            // No slave at address — fire ANACK error like real HW
+                            addressNackError.Value = true;
+                            errorInterruptPending.Value = true;
+                            EventTriggered?.Invoke((uint)Registers.ErrorInterruptPending);
+                            UpdateInterrupts();
+                        }
+                        else
+                        {
+                            TrySendDataToSlave();
+                            slaveToMasterBuffer.Clear();
+                            LegacyPrefetchFromSlave();
+                            LegacyDeliverNextRxByte();
+                        }
+                    }
                 })
                 .WithReservedBits(1, 31)
             ;
@@ -89,11 +112,25 @@ namespace Antmicro.Renode.Peripherals.I2C
                     }
 
                     transmissionInProgress = true;
-                    // send what is buffered as this might be a repeated start condition
-                    TrySendDataToSlave();
-                    // prepare to receive data from slave
-                    slaveToMasterBuffer.Clear();
-                    // wait for writing bytes to TransferBuffer...
+
+                    if(twimMode)
+                    {
+                        PerformTwimTransmit();
+                    }
+                    else
+                    {
+                        if(selectedSlave == null)
+                        {
+                            // No slave at address — fire ANACK error like real HW
+                            addressNackError.Value = true;
+                            errorInterruptPending.Value = true;
+                            EventTriggered?.Invoke((uint)Registers.ErrorInterruptPending);
+                            UpdateInterrupts();
+                            return;
+                        }
+                        TrySendDataToSlave();
+                        slaveToMasterBuffer.Clear();
+                    }
                 })
                 .WithReservedBits(1, 31)
             ;
@@ -111,6 +148,25 @@ namespace Antmicro.Renode.Peripherals.I2C
                 .WithReservedBits(1, 31)
             ;
 
+            Registers.SuspendTransmitting.Define(this)
+                .WithFlag(0, FieldMode.Write, name: "TASKS_SUSPEND", writeCallback: (_, val) =>
+                {
+                    if(!val)
+                    {
+                        return;
+                    }
+
+                    if(!transmissionInProgress)
+                    {
+                        return;
+                    }
+
+                    legacySuspended = true;
+                    this.Log(LogLevel.Noisy, "TWI legacy: suspended");
+                })
+                .WithReservedBits(1, 31)
+            ;
+
             Registers.ResumeReceiving.Define(this)
                 .WithFlag(0, FieldMode.Write, name: "TASKS_RESUME", writeCallback: (_, val) =>
                 {
@@ -124,7 +180,17 @@ namespace Antmicro.Renode.Peripherals.I2C
                         return;
                     }
 
-                    TryFillReceivedBuffer(true);
+                    legacySuspended = false;
+                    this.Log(LogLevel.Noisy, "TWI legacy: resumed");
+
+                    if(!twimMode)
+                    {
+                        LegacyDeliverNextRxByte();
+                    }
+                    else
+                    {
+                        TryFillReceivedBuffer(true);
+                    }
                 })
                 .WithReservedBits(1, 31)
             ;
@@ -153,6 +219,30 @@ namespace Antmicro.Renode.Peripherals.I2C
                 .WithWriteCallback((_, __) => UpdateInterrupts())
             ;
 
+            Registers.LastRxEventPending.Define(this)
+                .WithFlag(0, out lastRxEventPending, name: "EVENTS_LASTRX")
+                .WithReservedBits(1, 31)
+                .WithWriteCallback((_, __) => UpdateInterrupts())
+            ;
+
+            Registers.LastTxEventPending.Define(this)
+                .WithFlag(0, out lastTxEventPending, name: "EVENTS_LASTTX")
+                .WithReservedBits(1, 31)
+                .WithWriteCallback((_, __) => UpdateInterrupts())
+            ;
+
+            Registers.ByteBoundaryEventPending.Define(this)
+                .WithFlag(0, out bbEventPending, name: "EVENTS_BB")
+                .WithReservedBits(1, 31)
+                .WithWriteCallback((_, __) => UpdateInterrupts())
+            ;
+
+            Registers.SuspendedEventPending.Define(this)
+                .WithFlag(0, out suspendedEventPending, name: "EVENTS_SUSPENDED")
+                .WithReservedBits(1, 31)
+                .WithWriteCallback((_, __) => UpdateInterrupts())
+            ;
+
             Registers.ErrorSource.Define(this)
                 .WithTaggedFlag("OVERRUN", 0)
                 .WithFlag(1, out addressNackError, name: "ANACK")
@@ -161,9 +251,16 @@ namespace Antmicro.Renode.Peripherals.I2C
             ;
 
             Registers.Shortcuts.Define(this)
-                .WithTag("BB_SUSPEND", 0, 1)
+                .WithFlag(0, out byteBoundarySuspendShortcut, name: "BB_SUSPEND")
                 .WithFlag(1, out byteBoundaryStopShortcut, name: "BB_STOP")
-                .WithReservedBits(2, 30)
+                .WithReservedBits(2, 4)
+                .WithTag("LASTTX_STARTRX", 7, 1)
+                .WithTag("LASTTX_SUSPEND", 8, 1)
+                .WithFlag(9, out lastTxStopShortcut, name: "LASTTX_STOP")
+                .WithTag("LASTRX_STARTTX", 10, 1)
+                .WithTag("LASTRX_SUSPEND", 11, 1)
+                .WithFlag(12, out lastRxStopShortcut, name: "LASTRX_STOP")
+                .WithReservedBits(13, 19)
             ;
 
             Registers.SetEnableInterrupts.Define(this)
@@ -175,9 +272,9 @@ namespace Antmicro.Renode.Peripherals.I2C
                 .WithReservedBits(8, 1)
                 .WithFlag(9, out errorInterruptEnabled, FieldMode.Read | FieldMode.Set, name: "ERROR")
                 .WithReservedBits(10, 4)
-                .WithFlag(14, name: "BB") // this is a flag to limit warnings, we don't support the byte-boundary interrupt
+                .WithFlag(14, out bbInterruptEnabled, FieldMode.Read | FieldMode.Set, name: "BB")
                 .WithReservedBits(15, 3)
-                .WithFlag(18, name: "SUSPENDED") // this is a flag to limit warnings, we don't support the suspended interrupt
+                .WithFlag(18, out suspendedInterruptEnabled, FieldMode.Read | FieldMode.Set, name: "SUSPENDED")
                 .WithReservedBits(19, 13)
                 .WithWriteCallback((_, __) => UpdateInterrupts())
             ;
@@ -199,9 +296,13 @@ namespace Antmicro.Renode.Peripherals.I2C
                     writeCallback: (_, val) => { if(val) errorInterruptEnabled.Value = false; },
                     valueProviderCallback: _ => errorInterruptEnabled.Value)
                 .WithReservedBits(10, 4)
-                .WithFlag(14, name: "BB") // this is a flag to limit warnings, we don't support the byte-boundary interrupt
+                .WithFlag(14, name: "BB",
+                    writeCallback: (_, val) => { if(val) bbInterruptEnabled.Value = false; },
+                    valueProviderCallback: _ => bbInterruptEnabled.Value)
                 .WithReservedBits(15, 3)
-                .WithFlag(18, name: "SUSPENDED") // this is a flag to limit warnings, we don't support the suspended interrupt
+                .WithFlag(18, name: "SUSPENDED",
+                    writeCallback: (_, val) => { if(val) suspendedInterruptEnabled.Value = false; },
+                    valueProviderCallback: _ => suspendedInterruptEnabled.Value)
                 .WithReservedBits(19, 13)
                 .WithWriteCallback((_, __) => UpdateInterrupts())
             ;
@@ -213,10 +314,17 @@ namespace Antmicro.Renode.Peripherals.I2C
                     {
                     case 0:
                         enabled = false;
+                        twimMode = false;
                         break;
 
-                    case 5:
+                    case 5: // TWI (legacy byte-by-byte)
                         enabled = true;
+                        twimMode = false;
+                        break;
+
+                    case 6: // TWIM (EasyDMA)
+                        enabled = true;
+                        twimMode = true;
                         break;
 
                     default:
@@ -230,15 +338,26 @@ namespace Antmicro.Renode.Peripherals.I2C
             Registers.ReceiveBuffer.Define(this)
                 .WithValueField(0, 8, FieldMode.Read, valueProviderCallback: _ =>
                 {
-                    if(!TryReadFromSlave(out var result))
+                    if(!slaveToMasterBuffer.TryDequeue(out var result))
                     {
                         this.Log(LogLevel.Warning, "Trying to read from an empty fifo");
                         result = 0;
                     }
-
-                    if(byteBoundaryStopShortcut.Value)
+                    else
                     {
-                        StopTransmission();
+                        this.Log(LogLevel.Noisy, "TWI legacy RXD read: 0x{0:X2}, {1} bytes remain", result, slaveToMasterBuffer.Count);
+                    }
+
+                    if(!twimMode && transmissionInProgress)
+                    {
+                        if(byteBoundaryStopShortcut.Value)
+                        {
+                            StopTransmission();
+                        }
+                        else if(!legacySuspended)
+                        {
+                            LegacyDeliverNextRxByte();
+                        }
                     }
 
                     return result;
@@ -265,6 +384,58 @@ namespace Antmicro.Renode.Peripherals.I2C
                     UpdateInterrupts();
                 })
                 .WithReservedBits(8, 24)
+            ;
+
+            Registers.PinSelectSCL.Define(this)
+                .WithValueField(0, 32, name: "PSEL.SCL")
+            ;
+
+            Registers.PinSelectSDA.Define(this)
+                .WithValueField(0, 32, name: "PSEL.SDA")
+            ;
+
+            Registers.Frequency.Define(this)
+                .WithValueField(0, 32, name: "FREQUENCY")
+            ;
+
+            Registers.RxdPtr.Define(this)
+                .WithValueField(0, 32, out rxdPtr, name: "RXD.PTR")
+            ;
+
+            Registers.RxdMaxCnt.Define(this)
+                .WithValueField(0, 16, out rxdMaxCnt, name: "RXD.MAXCNT")
+                .WithReservedBits(16, 16)
+            ;
+
+            Registers.RxdAmount.Define(this)
+                .WithValueField(0, 16, FieldMode.Read, name: "RXD.AMOUNT",
+                    valueProviderCallback: _ => (uint)rxAmount)
+                .WithReservedBits(16, 16)
+            ;
+
+            Registers.RxdList.Define(this)
+                .WithValueField(0, 3, name: "RXD.LIST")
+                .WithReservedBits(3, 29)
+            ;
+
+            Registers.TxdPtr.Define(this)
+                .WithValueField(0, 32, out txdPtr, name: "TXD.PTR")
+            ;
+
+            Registers.TxdMaxCnt.Define(this)
+                .WithValueField(0, 16, out txdMaxCnt, name: "TXD.MAXCNT")
+                .WithReservedBits(16, 16)
+            ;
+
+            Registers.TxdAmount.Define(this)
+                .WithValueField(0, 16, FieldMode.Read, name: "TXD.AMOUNT",
+                    valueProviderCallback: _ => (uint)txAmount)
+                .WithReservedBits(16, 16)
+            ;
+
+            Registers.TxdList.Define(this)
+                .WithValueField(0, 3, name: "TXD.LIST")
+                .WithReservedBits(3, 29)
             ;
 
             Registers.Address.Define(this)
@@ -355,17 +526,154 @@ namespace Antmicro.Renode.Peripherals.I2C
         private void StopTransmission()
         {
             transmissionInProgress = false;
+            legacySuspended = false;
 
-            // send out buffered data to slave;
-            // in reality there is no fifo - each
-            // byte is sent right away, but our
-            // I2C interface in Renode works a bit
-            // different
             TrySendDataToSlave();
 
             selectedSlave?.FinishTransmission();
 
             stoppedInterruptPending.Value = true;
+            UpdateInterrupts();
+        }
+
+        private void LegacyPrefetchFromSlave()
+        {
+            if(selectedSlave == null)
+            {
+                return;
+            }
+
+            if(!slaveToMasterBuffer.Any())
+            {
+                var data = selectedSlave.Read();
+                slaveToMasterBuffer.EnqueueRange(data);
+                this.Log(LogLevel.Noisy, "TWI legacy: prefetched {0} bytes from slave 0x{1:X}", data.Length, address.Value);
+            }
+        }
+
+        private void LegacyDeliverNextRxByte()
+        {
+            if(!transmissionInProgress || legacySuspended)
+            {
+                return;
+            }
+
+            if(!slaveToMasterBuffer.Any())
+            {
+                LegacyPrefetchFromSlave();
+            }
+
+            if(slaveToMasterBuffer.Any())
+            {
+                rxInterruptPending.Value = true;
+                EventTriggered?.Invoke((uint)Registers.RxInterruptPending);
+
+                bbEventPending.Value = true;
+                EventTriggered?.Invoke((uint)Registers.ByteBoundaryEventPending);
+
+                if(byteBoundarySuspendShortcut.Value)
+                {
+                    legacySuspended = true;
+                    suspendedEventPending.Value = true;
+                    EventTriggered?.Invoke((uint)Registers.SuspendedEventPending);
+                }
+
+                UpdateInterrupts();
+            }
+            else
+            {
+                this.Log(LogLevel.Warning, "TWI legacy RX: no data available from slave 0x{0:X}", address.Value);
+            }
+        }
+
+        private void PerformTwimTransmit()
+        {
+            var count = (int)txdMaxCnt.Value;
+            var ptr = (ulong)txdPtr.Value;
+
+            if(selectedSlave == null)
+            {
+                this.Log(LogLevel.Warning, "TWIM TX: no slave at address 0x{0:X}", address.Value);
+                addressNackError.Value = true;
+                errorInterruptPending.Value = true;
+                EventTriggered?.Invoke((uint)Registers.ErrorInterruptPending);
+                UpdateInterrupts();
+                return;
+            }
+
+            if(count > 0 && ptr >= 0x20000000)
+            {
+                var data = machine.SystemBus.ReadBytes(ptr, count);
+                this.Log(LogLevel.Noisy, "TWIM TX: sending {0} bytes from 0x{1:X} to slave 0x{2:X}", count, ptr, address.Value);
+                selectedSlave.Write(data);
+                txAmount = count;
+            }
+            else
+            {
+                txAmount = 0;
+            }
+
+            txInterruptPending.Value = true;
+            EventTriggered?.Invoke((uint)Registers.TxInterruptPending);
+
+            lastTxEventPending.Value = true;
+            EventTriggered?.Invoke((uint)Registers.LastTxEventPending);
+
+            if(lastTxStopShortcut != null && lastTxStopShortcut.Value)
+            {
+                StopTransmission();
+            }
+            else
+            {
+                stoppedInterruptPending.Value = true;
+                EventTriggered?.Invoke((uint)Registers.StoppedInterruptPending);
+            }
+            UpdateInterrupts();
+        }
+
+        private void PerformTwimReceive()
+        {
+            var count = (int)rxdMaxCnt.Value;
+            var ptr = (ulong)rxdPtr.Value;
+
+            if(selectedSlave == null)
+            {
+                this.Log(LogLevel.Warning, "TWIM RX: no slave at address 0x{0:X}", address.Value);
+                addressNackError.Value = true;
+                errorInterruptPending.Value = true;
+                EventTriggered?.Invoke((uint)Registers.ErrorInterruptPending);
+                UpdateInterrupts();
+                return;
+            }
+
+            var data = selectedSlave.Read(count);
+            if(data.Length > 0 && ptr >= 0x20000000)
+            {
+                var toWrite = Math.Min(data.Length, count);
+                this.Log(LogLevel.Noisy, "TWIM RX: received {0} bytes to 0x{1:X} from slave 0x{2:X}", toWrite, ptr, address.Value);
+                machine.SystemBus.WriteBytes(data, ptr, 0, toWrite);
+                rxAmount = toWrite;
+            }
+            else
+            {
+                rxAmount = 0;
+            }
+
+            rxInterruptPending.Value = true;
+            EventTriggered?.Invoke((uint)Registers.RxInterruptPending);
+
+            lastRxEventPending.Value = true;
+            EventTriggered?.Invoke((uint)Registers.LastRxEventPending);
+
+            if(lastRxStopShortcut != null && lastRxStopShortcut.Value)
+            {
+                StopTransmission();
+            }
+            else
+            {
+                stoppedInterruptPending.Value = true;
+                EventTriggered?.Invoke((uint)Registers.StoppedInterruptPending);
+            }
             UpdateInterrupts();
         }
 
@@ -377,6 +685,8 @@ namespace Antmicro.Renode.Peripherals.I2C
             flag |= rxInterruptEnabled.Value && rxInterruptPending.Value;
             flag |= stoppedInterruptEnabled.Value && stoppedInterruptPending.Value;
             flag |= errorInterruptEnabled.Value && errorInterruptPending.Value;
+            flag |= bbInterruptEnabled.Value && bbEventPending.Value;
+            flag |= suspendedInterruptEnabled.Value && suspendedEventPending.Value;
 
             this.Log(LogLevel.Noisy, "Setting IRQ to {0}", flag);
             IRQ.Set(flag);
@@ -384,7 +694,11 @@ namespace Antmicro.Renode.Peripherals.I2C
 
         private II2CPeripheral selectedSlave;
         private bool enabled;
+        private bool twimMode;
         private bool transmissionInProgress;
+        private bool legacySuspended;
+        private int rxAmount;
+        private int txAmount;
 
         private IValueRegisterField address;
         private IFlagRegisterField txInterruptPending;
@@ -399,10 +713,27 @@ namespace Antmicro.Renode.Peripherals.I2C
         private IFlagRegisterField stoppedInterruptPending;
         private IFlagRegisterField stoppedInterruptEnabled;
 
+        private IFlagRegisterField byteBoundarySuspendShortcut;
         private IFlagRegisterField byteBoundaryStopShortcut;
+        private IFlagRegisterField lastTxStopShortcut;
+        private IFlagRegisterField lastRxStopShortcut;
+
+        private IFlagRegisterField lastRxEventPending;
+        private IFlagRegisterField lastTxEventPending;
+        private IFlagRegisterField bbEventPending;
+        private IFlagRegisterField suspendedEventPending;
+
+        private IFlagRegisterField bbInterruptEnabled;
+        private IFlagRegisterField suspendedInterruptEnabled;
 
         private IFlagRegisterField addressNackError;
 
+        private IValueRegisterField rxdPtr;
+        private IValueRegisterField rxdMaxCnt;
+        private IValueRegisterField txdPtr;
+        private IValueRegisterField txdMaxCnt;
+
+        private new readonly IMachine machine;
         private readonly Queue<byte> slaveToMasterBuffer;
         private readonly Queue<byte> masterToSlaveBuffer;
 
@@ -418,7 +749,9 @@ namespace Antmicro.Renode.Peripherals.I2C
             TxInterruptPending = 0x11C,
             ErrorInterruptPending = 0x124,
             ByteBoundaryEventPending = 0x138,
-            SuspendedInterruptPending = 0x148,
+            LastRxEventPending = 0x148,
+            LastTxEventPending = 0x15C,
+            SuspendedEventPending = 0x160,
             Shortcuts = 0x200,
             SetEnableInterrupts = 0x304,
             ClearEnableInterrupts = 0x308,
@@ -429,6 +762,14 @@ namespace Antmicro.Renode.Peripherals.I2C
             ReceiveBuffer = 0x518,
             TransferBuffer = 0x51C,
             Frequency = 0x524,
+            RxdPtr = 0x534,
+            RxdMaxCnt = 0x538,
+            RxdAmount = 0x53C,
+            RxdList = 0x540,
+            TxdPtr = 0x544,
+            TxdMaxCnt = 0x548,
+            TxdAmount = 0x54C,
+            TxdList = 0x550,
             Address = 0x588
         }
     }
