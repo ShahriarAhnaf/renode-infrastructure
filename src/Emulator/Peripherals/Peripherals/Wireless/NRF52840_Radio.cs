@@ -127,6 +127,9 @@ namespace Antmicro.Renode.Peripherals.Wireless
 
             DefineTask(Registers.Disable, Disable, "TASKS_DISABLE");
 
+            DefineTask(Registers.CCAStart, CCAStart, "TASKS_CCASTART");
+            DefineTask(Registers.CCAStop, () => { }, "TASKS_CCASTOP");
+
             DefineEvent(Registers.Ready, () => this.Log(LogLevel.Error, "Trying to trigger READY event, not supported"), Events.Ready, "EVENTS_READY");
             DefineEvent(Registers.AddressSentOrReceived, () => this.Log(LogLevel.Error, "Trying to trigger ADDRESS event, not supported"), Events.Address, "EVENTS_ADDRESS");
             DefineEvent(Registers.PayloadSentOrReceived, () => this.Log(LogLevel.Error, "Trying to trigger PAYLOAD event, not supported"), Events.Payload, "EVENTS_PAYLOAD");
@@ -140,6 +143,9 @@ namespace Antmicro.Renode.Peripherals.Wireless
             DefineEvent(Registers.TxReady, TxEnable, Events.TxReady, "EVENTS_TXREADY");
 
             DefineEvent(Registers.RxReady, RxEnable, Events.RxReady, "EVENTS_RXREADY");
+
+            DefineEvent(Registers.CCAIdle, () => { }, Events.CCAIdle, "EVENTS_CCAIDLE");
+            DefineEvent(Registers.CCABusy, () => { }, Events.CCABusy, "EVENTS_CCABUSY");
 
             // Notice: while the whole Shorts register is implemented, we don't necessarily
             // support all the mentioned events and tasks
@@ -320,9 +326,19 @@ namespace Antmicro.Renode.Peripherals.Wireless
         {
             radioState = State.Disabled;
             SetEvent(Events.Disabled);
+
+            if(shorts.DisabledTxEnable.Value)
+            {
+                TxEnable();
+                return;
+            }
+            if(shorts.DisabledRxEnable.Value)
+            {
+                RxEnable();
+                return;
+            }
+
             LogUnhandledShort(shorts.DisabledRSSIStop, nameof(shorts.DisabledRSSIStop));
-            LogUnhandledShort(shorts.DisabledRxEnable, nameof(shorts.DisabledRxEnable));
-            LogUnhandledShort(shorts.DisabledTxEnable, nameof(shorts.DisabledTxEnable));
         }
 
         // These comments sum up some details gathered from the documentation.
@@ -379,7 +395,21 @@ namespace Antmicro.Renode.Peripherals.Wireless
             {
                 Start();
             }
+            else if(shorts.RxReadyCCAStart.Value)
+            {
+                CCAStart();
+            }
             LogUnhandledShort(shorts.ReadyEnergyDetectStart, nameof(shorts.ReadyEnergyDetectStart));
+        }
+
+        private void CCAStart()
+        {
+            SetEvent(Events.CCAIdle);
+
+            if(shorts.CCAIdleTxEnable.Value)
+            {
+                TxEnable();
+            }
         }
 
         private void Start()
@@ -448,7 +478,6 @@ namespace Antmicro.Renode.Peripherals.Wireless
             var crcLen = 4;
             ScheduleRadioEvents((uint)(headerLengthInAir + payloadLength + crcLen));
 
-            LogUnhandledShort(shorts.EndStart, nameof(shorts.EndStart)); // not sure how to support it. It's instant from our perspective.
         }
 
         private void ScheduleRadioEvents(uint packetLen)
@@ -503,6 +532,11 @@ namespace Antmicro.Renode.Peripherals.Wireless
                 SetEvent(Events.Payload);
                 SetEvent(Events.End);
                 SetEvent(Events.CRCOk);
+
+                if(shorts.EndStart.Value)
+                {
+                    Start();
+                }
             }, endTimeStamp);
 
             // BLE stacks use disabled event as common processing trigger.
