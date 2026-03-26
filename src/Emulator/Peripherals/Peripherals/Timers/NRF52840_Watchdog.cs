@@ -151,13 +151,27 @@ namespace Antmicro.Renode.Peripherals.Timers
                         valueProviderCallback: (j, _) => requestRegisterEnabled[j])
                     .WithReservedBits(NumberOfRegisters, 32 - NumberOfRegisters)
                 },
-                {(long)Register.Config, new DoubleWordRegister(this)
-                    .WithFlag(0, name: "SLEEP")
+                {(long)Register.Config, new DoubleWordRegister(this, 0x1)
+                    .WithFlag(0, out configSleep, name: "SLEEP",
+                        writeCallback: (_, value) =>
+                        {
+                            if(Enabled)
+                            {
+                                this.Log(LogLevel.Warning, "Tried to change CONFIG while watchdog is running, ignored");
+                                return;
+                            }
+                        })
                     .WithReservedBits(1, 2)
-                    .WithFlag(3, name: "HALT")
+                    .WithFlag(3, out configHalt, name: "HALT",
+                        writeCallback: (_, value) =>
+                        {
+                            if(Enabled)
+                            {
+                                this.Log(LogLevel.Warning, "Tried to change CONFIG while watchdog is running, ignored");
+                                return;
+                            }
+                        })
                     .WithReservedBits(4, 28)
-                    .WithWriteCallback((_, value) => this.Log(LogLevel.Warning, $"Write to a dummy implementation of the Config register, value: 0x{value:X}"))
-                    .WithReadCallback((_, value) => this.Log(LogLevel.Warning, $"Read from a dummy implementation of the Config register, returned: 0x{value:X}"))
                 }
             };
 
@@ -232,6 +246,8 @@ namespace Antmicro.Renode.Peripherals.Timers
 
         private DoubleWordRegisterCollection registers;
         private IFlagRegisterField eventTimeoutEnabled;
+        private IFlagRegisterField configSleep;
+        private IFlagRegisterField configHalt;
         private IFlagRegisterField[] requestRegisterStatus;
         private readonly bool[] requestRegisterEnabled;
 
