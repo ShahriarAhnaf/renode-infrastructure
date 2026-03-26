@@ -21,12 +21,16 @@ using ELFSharp.UImage;
 
 namespace Antmicro.Renode.Peripherals.CPU
 {
+    [GPIO(NumberOfInputs = 0x1000 + 1)]
     public partial class CortexM : Arm, IPeripheralWithTransactionState
     {
         public CortexM(string cpuType, IMachine machine, NVIC nvic, [NameAlias("id")] uint cpuId = 0, Endianess endianness = Endianess.LittleEndian,
             uint? fpuInterruptNumber = null, uint? numberOfMPURegions = null, bool enableTrustZone = false, uint? numberOfSAURegions = null, uint? numberOfIDAURegions = null)
             : base(cpuType, machine, cpuId, endianness, numberOfMPURegions)
         {
+            CpuWaitSignal = new GPIO();
+            CpuWaitSignal.AddStateChangedHook((state) => UpdateCPUWait(state));
+
             if(nvic == null)
             {
                 // Free unmanaged resources allocated by the base class constructor
@@ -79,9 +83,22 @@ namespace Antmicro.Renode.Peripherals.CPU
 
         public override void Reset()
         {
-            pcNotInitialized = true;
-            vtorInitialized = false;
-            base.Reset();
+            var isCpuWaitSet = CpuWaitSignal.IsSet;
+
+            InnerReset();
+
+            IsHalted = isCpuWaitSet;
+        }
+
+        public override void OnGPIO(int number, bool value)
+        {
+            if(number >= (long)FirstSignalNumber)
+            {
+                this.NoisyLog("Treating IRQ #{0} as a signal set to {1}", number, value);
+                OnSignal((CpuSignal)number, value);
+                return;
+            }
+            base.OnGPIO(number, value);
         }
 
         public override void InitFromElf(IELF elf)
@@ -185,6 +202,8 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         public override string GetLLVMTriple(uint flags) => AllLLVMTriples[0];
+
+        public GPIO CpuWaitSignal { get; }
 
         public override string Architecture { get { return "arm-m"; } }
 
@@ -846,6 +865,33 @@ namespace Antmicro.Renode.Peripherals.CPU
             base.OnLeavingResetState();
         }
 
+        private void InnerReset()
+        {
+            pcNotInitialized = true;
+            vtorInitialized = false;
+            base.Reset();
+        }
+
+        private void OnSignal(CpuSignal signal, bool value)
+        {
+            switch(signal)
+            {
+            case CpuSignal.CpuWait:
+                CpuWaitSignal.Set(value);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(signal), $"Unknown CPU signal {signal}");
+            }
+        }
+
+        private void UpdateCPUWait(bool state)
+        {
+            if(!state)
+            {
+                IsHalted = false;
+            }
+        }
+
         [Export]
         private int FindPendingIRQ()
         {
@@ -1283,6 +1329,13 @@ namespace Antmicro.Renode.Peripherals.CPU
             private const uint IDAURlarNonSecureCallableFlag = 1u << 1;
         }
 
+        // GPIO pins that should be treated as signals.
+        // Starts at 0x1000 to avoid interfering with interrupt numbers.
+        public enum CpuSignal
+        {
+            CpuWait = 0x1000 // CPUWAIT
+        }
+
         // Keep in line with ExternalIDAURequest struct in tlib's arm/arch_callbacks.h
         [StructLayout(LayoutKind.Sequential)]
         private struct ExternalIDAURequest
@@ -1292,6 +1345,8 @@ namespace Antmicro.Renode.Peripherals.CPU
             public int AccessType;
             public int AccessWidth;
         }
+
+        private static readonly CpuSignal FirstSignalNumber = CpuSignal.CpuWait;
 
         private static readonly ContextState secureState = new ContextState { Privileged = true, CpuSecure = true, AttributionSecure = true };
 

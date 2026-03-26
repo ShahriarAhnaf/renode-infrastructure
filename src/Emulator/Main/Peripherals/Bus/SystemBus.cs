@@ -232,19 +232,17 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         public bool TryFindSymbolAt(ulong offset, out string name, out Symbol symbol, ICPU context = null, bool functionOnly = false)
         {
-            if(!pcCache.TryGetValue(offset, out var entry))
+            if(!pcCache.TryGetValue(Tuple.Create(context, offset), out var entry))
             {
-                if(!GetLookup(context).TryGetSymbolByAddress(offset, out symbol, functionOnly))
+                var localLookup = GetLookup(context);
+                if(!localLookup.TryGetSymbolByAddress(offset, out symbol, functionOnly) && !(localLookup != globalLookup && globalLookup.TryGetSymbolByAddress(offset, out symbol, functionOnly)))
                 {
                     symbol = null;
                     name = null;
                     return false;
                 }
-                else
-                {
-                    name = symbol.ToStringRelative(offset);
-                }
-                pcCache.Add(offset, Tuple.Create(name, symbol));
+                name = symbol.ToStringRelative(offset);
+                pcCache.Add(Tuple.Create(context, offset), Tuple.Create(name, symbol));
             }
             else
             {
@@ -1165,14 +1163,15 @@ namespace Antmicro.Renode.Peripherals.Bus
             var methods = PeripheralAccessMethods.CreateWithLock();
             if(registrationPoint is BusParametrizedRegistration parametrizedRegistrationPoint)
             {
-                parametrizedRegistrationPoint.RegisterForEachContext((contextRegistration) =>
+                parametrizedRegistrationPoint.RegisterForEachContext((context) =>
                 {
                     // Prepare accessor methods in the context of registration,
                     // as it may want to fill them according to the CPU context.
                     methods = PeripheralAccessMethods.CreateWithLock();
-                    contextRegistration.FillAccessMethods(peripheral, ref methods);
+                    parametrizedRegistrationPoint.FillAccessMethods(peripheral, ref methods);
+
                     FillAccessMethodsWithDefaultMethods(peripheral, ref methods);
-                    RegisterInner(peripheral, methods, contextRegistration, context: contextRegistration.Initiator);
+                    RegisterInner(peripheral, methods, registrationPoint, context);
                 });
             }
             else if(registrationPoint is BusMultiRegistration multiRegistrationPoint)
@@ -1182,12 +1181,12 @@ namespace Antmicro.Renode.Peripherals.Bus
                     throw new ConstructionException(string.Format("It is not allowed to register `{0}` peripheral using `{1}`", typeof(IMapped).Name, typeof(BusMultiRegistration).Name));
                 }
                 FillAccessMethodsWithTaggedMethods(peripheral, multiRegistrationPoint.ConnectionRegionName, ref methods);
-                multiRegistrationPoint.RegisterForEachContext((contextRegistration) => RegisterInner(peripheral, methods, contextRegistration, context: contextRegistration.Initiator));
+                multiRegistrationPoint.RegisterForEachContext((context) => RegisterInner(peripheral, methods, registrationPoint, context));
             }
             else
             {
                 FillAccessMethodsWithDefaultMethods(peripheral, ref methods);
-                registrationPoint.RegisterForEachContext((contextRegistration) => RegisterInner(peripheral, methods, contextRegistration, context: contextRegistration.Initiator));
+                registrationPoint.RegisterForEachContext((context) => RegisterInner(peripheral, methods, registrationPoint, context));
             }
         }
 
@@ -1222,8 +1221,16 @@ namespace Antmicro.Renode.Peripherals.Bus
             {
                 throw new RecoverableException("Moving a peripheral is supported only from CPU thread if context isn't explicitly set");
             }
-            var wasMapped = RemoveMappingsForPeripheral(peripheral);
-            var busRegisteredEntries = peripheralsCollectionByContext[context].Peripherals.Where(x => x.Peripheral == peripheral).ToList();
+            if(newRegistration.Initiator != context)
+            {
+                throw new RecoverableException("New registration must be exclusively on the current context");
+            }
+            if(IsAddressRangeLocked(newRegistration.Range, context))
+            {
+                throw new RecoverableException("Moving a peripheral to a locked address range is not supported");
+            }
+
+            var busRegisteredEntries = peripheralsCollectionByContext[context].Peripherals.Where(x => x.Peripheral == peripheral && x.RegistrationPoint.Initiator == context).ToList();
             if(busRegisteredEntries.Count == 0)
             {
                 throw new RecoverableException("Attempted to move a peripheral that isn't registered within current context");
@@ -1247,8 +1254,10 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
             if(IsAddressRangeLocked(busRegistered.RegistrationPoint.Range, context))
             {
-                throw new RecoverableException("Moving a peripheral to a locked address range is not supported");
+                throw new RecoverableException("Moving a peripheral from a locked address range is not supported");
             }
+
+            var wasMapped = RemoveMappingsForPeripheral(peripheral, context);
             UnregisterAccessFlags(busRegistered.RegistrationPoint, context);
             peripheralsCollectionByContext.WithStateCollection(context, null, collection =>
             {
@@ -1589,7 +1598,7 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         private void UnregisterInner(IBusPeripheral peripheral)
         {
-            RemoveMappingsForPeripheral(peripheral);
+            RemoveMappingsForPeripheral(peripheral, null);
 
             // remove the peripheral from all cpu-local and the global mappings
             foreach(var pair in peripheralsCollectionByContext.GetAllContextKeys()
@@ -1618,7 +1627,7 @@ namespace Antmicro.Renode.Peripherals.Bus
                 // it is assumed that mapped segment cannot be partially outside the registration point range
                 foreach(var mapping in mappingsForPeripheral[busRegistered.Peripheral].Where(x => busRegistered.RegistrationPoint.Range.Contains(x.StartingOffset)))
                 {
-                    UnmapMemory(new Range(mapping.StartingOffset, checked((ulong)mapping.Size)));
+                    UnmapMemory(new Range(mapping.StartingOffset, checked((ulong)mapping.Size)), mapping.Context);
                     toRemove.Add(mapping);
                 }
                 mappingsForPeripheral[busRegistered.Peripheral].RemoveAll(x => toRemove.Contains(x));
@@ -2295,17 +2304,38 @@ namespace Antmicro.Renode.Peripherals.Bus
             }
         }
 
-        private bool RemoveMappingsForPeripheral(IBusPeripheral peripheral)
+        private bool RemoveMappingsForPeripheral(IBusPeripheral peripheral, ICPU context)
         {
             if(!mappingsForPeripheral.ContainsKey(peripheral))
             {
                 return false;
             }
+
+            var newMappings = new List<MappedSegmentWrapper>();
+
             foreach(var mapping in mappingsForPeripheral[peripheral])
             {
-                UnmapMemory(new Range(mapping.StartingOffset, mapping.Size));
+                if(context != null && mapping.Context != context)
+                {
+                    newMappings.Add(mapping);
+                    continue;
+                }
+                UnmapMemory(new Range(mapping.StartingOffset, mapping.Size), mapping.Context);
             }
-            mappingsForPeripheral.Remove(peripheral);
+
+            if(mappingsForPeripheral[peripheral].Count == newMappings.Count)
+            {
+                return false;
+            }
+
+            if(newMappings.Count == 0)
+            {
+                mappingsForPeripheral.Remove(peripheral);
+            }
+            else
+            {
+                mappingsForPeripheral[peripheral] = newMappings;
+            }
             return true;
         }
 
@@ -2456,7 +2486,7 @@ namespace Antmicro.Renode.Peripherals.Bus
         private ContextKeyDictionary<MinimalRangesCollection, IReadOnlyMinimalRangesCollection> lockedRangesCollectionByContext;
         private readonly List<BinaryFingerprint> binaryFingerprints;
 
-        private readonly LRUCache<ulong, Tuple<string, Symbol>> pcCache = new LRUCache<ulong, Tuple<string, Symbol>>(10000);
+        private readonly LRUCache<Tuple<ICPU, ulong>, Tuple<string, Symbol>> pcCache = new LRUCache<Tuple<ICPU, ulong>, Tuple<string, Symbol>>(10000);
         private readonly ReaderWriterLockSlim cpuSync;
         private readonly Dictionary<ulong, List<BusHookHandler>> hooksOnRead;
         private readonly Dictionary<int, ICPU> cpuById;

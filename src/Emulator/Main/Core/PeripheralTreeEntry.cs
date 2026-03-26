@@ -1,11 +1,12 @@
 //
-// Copyright (c) 2010-2018 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
 using System;
+using System.Linq;
 
 using Antmicro.Migrant;
 using Antmicro.Migrant.Hooks;
@@ -53,9 +54,13 @@ namespace Antmicro.Renode.Core
 
         public string Name { get; private set; }
 
+        public string TypeName => type.FullName.Split('.').LastOrDefault();
+
         public int Level { get; private set; }
 
         public IRegistrationPoint RegistrationPoint { get; private set; }
+
+        public bool ShouldBePrinted { get; set; }
 
         [PreSerialization]
         private void SaveType()

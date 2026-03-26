@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
@@ -22,6 +22,25 @@ namespace Antmicro.Renode.Peripherals.Bus
                 Type = "Bus",
                 Value = StartingPoint
             };
+        }
+
+        public void RegisterForEachContext(Action<IPeripheral> register)
+        {
+            if(Cluster != null)
+            {
+                foreach(var cpu in Cluster.Clustered)
+                {
+                    register(cpu);
+                }
+            }
+            else if(Initiator != null)
+            {
+                register(Initiator);
+            }
+            else
+            {
+                register(null);
+            }
         }
 
         public override bool Equals(object obj)
@@ -54,7 +73,7 @@ namespace Antmicro.Renode.Peripherals.Bus
 
         public ulong Offset { get; set; }
 
-        public ulong StartingPoint { get; set; }
+        public virtual ulong StartingPoint { get; set; }
 
         public virtual string PrettyString
         {
@@ -77,26 +96,6 @@ namespace Antmicro.Renode.Peripherals.Bus
             Condition = condition;
             Offset = offset;
             StartingPoint = startingPoint;
-        }
-
-        protected void RegisterForEachContextInner<T>(Action<T> register, Func<IPeripheral, T> registrationForCpuGetter)
-            where T : BusRegistration
-        {
-            if(Cluster != null)
-            {
-                foreach(var cpu in Cluster.Clustered)
-                {
-                    register(registrationForCpuGetter(cpu));
-                }
-            }
-            else if(Initiator != null)
-            {
-                register(registrationForCpuGetter(Initiator));
-            }
-            else
-            {
-                register((T)this);
-            }
         }
     }
 }
