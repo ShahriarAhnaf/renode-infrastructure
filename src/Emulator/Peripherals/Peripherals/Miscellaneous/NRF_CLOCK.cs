@@ -40,6 +40,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             base.Reset();
             lfclkStarted = false;
             hfclkStarted = false;
+            previousIrqState = false;
+            IRQ.Unset();
             Update();
         }
 
@@ -54,8 +56,16 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
                     || (hfclkEventGenerated.Value && hfclkStartedEventEnabled.Value)
                     || (hfclk192mStartedEventEnabled.Value && hfclk192mStarted)
                     || (calibrationTimerTimeoutEvent.Value && calibrationTimerTimeoutEventEnabled.Value);
-            this.Log(LogLevel.Noisy, "Setting IRQ: {0}", irq);
-            IRQ.Set(irq);
+            this.Log(LogLevel.Noisy, "IRQ condition: {0} (prev {1})", irq, previousIrqState);
+            if(irq && !previousIrqState)
+            {
+                IRQ.Blink();
+            }
+            else if(!irq && previousIrqState)
+            {
+                IRQ.Unset();
+            }
+            previousIrqState = irq;
         }
 
         private void DefineRegisters()
@@ -256,8 +266,29 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             Registers.PowerUSBMainRegisterStatus.Define(this)
                 .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => true, name: "MAINREGSTATUS")
                 .WithReservedBits(1, 31);
+
+            Registers.Reserved0x108.Define(this)
+                .WithValueField(0, 32, name: "RESERVED_0x108");
+
+            Registers.HFCLKRun.Define(this)
+                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => hfclkStarted, name: "STATUS")
+                .WithReservedBits(1, 31);
+
+            Registers.LFCLKRun.Define(this)
+                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => lfclkStarted, name: "STATUS")
+                .WithReservedBits(1, 31);
+
+            Registers.HFCLKAlwaysRun.Define(this)
+                .WithValueField(0, 32, name: "ALWAYSRUN");
+
+            Registers.RamPowerControl.Define(this)
+                .WithValueField(0, 32, name: "RAM_POWER_CONTROL");
+
+            Registers.RamPowerSet0.Define(this)
+                .WithValueField(0, 32, name: "RAM_POWERSET");
         }
 
+        private bool previousIrqState;
         private bool lfclkStarted;
         private bool hfclkStarted;
         private bool hfclk192mStarted;
@@ -285,6 +316,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             StartHfClock192M = 0x20, // nRF5340
             HFXOCrystalOscillatorStarted = 0x100,
             LFCLKStarted = 0x104,
+            Reserved0x108 = 0x108,
             CalibrationOfLFRCCompleted = 0x10C,
             CalibrationTimerTimeout = 0x110,
             PowerUSBDetectedEvent = 0x11C, // POWER peripheral
@@ -294,18 +326,23 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             CalibrationTimerStopped = 0x12C,
             EnableInterrupt = 0x304,
             DisableInterrupt = 0x308,
+            HFCLKRun = 0x400,
             HFCLKStartTriggered = 0x408,
             HFCLKStatus = 0x40C,
+            LFCLKRun = 0x410,
             LFCLKStartTriggered = 0x414,
             LFCLKStatus = 0x418,
             LFCLKClockSourceCopy = 0x41C,
             PowerUsbRegisterStatus = 0x438,
             LFCLKClockSource = 0x518,
+            HFCLKAlwaysRun = 0x51C,
             HFXODebounceTime = 0x528,
             CallibrationTimerInterval = 0x538,
             TraceConfig = 0x55C,
             LFRCModeConfiguration = 0x5B4,
-            PowerUSBMainRegisterStatus = 0x640
+            PowerUSBMainRegisterStatus = 0x640,
+            RamPowerSet0 = 0x914,
+            RamPowerControl = 0xC34
         }
     }
 }
