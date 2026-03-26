@@ -1,4 +1,4 @@
-﻿//
+//
 // Copyright (c) 2010-2025 Antmicro
 //
 // This file is licensed under the MIT License.
@@ -27,6 +27,8 @@ namespace Antmicro.Renode.Peripherals.Timers
             this.numberOfEvents = numberOfEvents;
 
             this.eventCompareEnabled = new IFlagRegisterField[numberOfEvents];
+            this.shortClearEnabled = new bool[numberOfEvents];
+            this.shortStopEnabled = new bool[numberOfEvents];
             innerTimers = new ComparingTimer[numberOfEvents];
             for(var i = 0u; i < innerTimers.Length; i++)
             {
@@ -37,6 +39,23 @@ namespace Antmicro.Renode.Peripherals.Timers
                     this.Log(LogLevel.Noisy, "Compare Reached on CC{0} is {1}", j, innerTimers[j].Compare);
                     eventCompareEnabled[j].Value = true;
                     EventTriggered?.Invoke((uint)Register.Compare0EventPending + 0x4u * j);
+
+                    if(shortClearEnabled[j])
+                    {
+                        foreach(var timer in innerTimers)
+                        {
+                            timer.Value = 0;
+                        }
+                    }
+                    if(shortStopEnabled[j])
+                    {
+                        timerRunning = false;
+                        foreach(var timer in innerTimers)
+                        {
+                            timer.Enabled = false;
+                        }
+                    }
+
                     UpdateInterrupts();
                 };
             }
@@ -53,6 +72,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                 timer.Reset();
             }
 
+            previousIrqState = false;
             IRQ.Unset();
         }
 
@@ -147,7 +167,7 @@ namespace Antmicro.Renode.Peripherals.Timers
                 register
                     .WithFlag(0, FieldMode.Write, name: "TASKS_CAPTURE", writeCallback: (_, __) =>
                     {
-                        SetCompare(idx, innerTimers[idx].Value);
+                        innerTimers[idx].Compare = innerTimers[idx].Value & GetBitModeMask();
                     })
                     .WithReservedBits(1, 31);
             });
@@ -161,6 +181,17 @@ namespace Antmicro.Renode.Peripherals.Timers
                     })
                     .WithReservedBits(1, 31);
             });
+
+            Register.Shortcuts.Define(this)
+                .WithFlags(0, numberOfEvents, name: "COMPARE_CLEAR",
+                    writeCallback: (i, _, value) => { shortClearEnabled[i] = value; },
+                    valueProviderCallback: (i, _) => shortClearEnabled[i])
+                .WithReservedBits(numberOfEvents, 8 - numberOfEvents)
+                .WithFlags(8, numberOfEvents, name: "COMPARE_STOP",
+                    writeCallback: (i, _, value) => { shortStopEnabled[i] = value; },
+                    valueProviderCallback: (i, _) => shortStopEnabled[i])
+                .WithReservedBits(8 + numberOfEvents, 32 - 8 - numberOfEvents)
+            ;
 
             Register.InterruptEnableSet.Define(this)
                 .WithReservedBits(0, 16)
@@ -192,6 +223,11 @@ namespace Antmicro.Renode.Peripherals.Timers
                 })
             ;
 
+            Register.BitMode.Define(this)
+                .WithEnumField(0, 2, out bitMode, name: "BITMODE")
+                .WithReservedBits(2, 30)
+            ;
+
             Register.Prescaler.Define(this)
                 .WithValueField(0, 4, out prescaler, name: "PRESCALER", writeCallback: (_, value) =>
                 {
@@ -212,16 +248,27 @@ namespace Antmicro.Renode.Peripherals.Timers
                     },
                     valueProviderCallback: _ =>
                     {
-                        return (uint)innerTimers[idx].Compare;
+                        return (uint)(innerTimers[idx].Compare & GetBitModeMask());
                     });
             });
+        }
+
+        private ulong GetBitModeMask()
+        {
+            switch(bitMode.Value)
+            {
+                case BitModeValue.Bit8: return 0xFF;
+                case BitModeValue.Bit16: return 0xFFFF;
+                case BitModeValue.Bit24: return 0xFFFFFF;
+                default: return 0xFFFFFFFF;
+            }
         }
 
         private void SetCompare(int idx, ulong value)
         {
             eventCompareEnabled[idx].Value = false;
             UpdateInterrupts();
-            innerTimers[idx].Compare = value;
+            innerTimers[idx].Compare = value & GetBitModeMask();
         }
 
         private void UpdateInterrupts()
@@ -233,15 +280,27 @@ namespace Antmicro.Renode.Peripherals.Timers
                 flag |= eventCompareInterruptEnabled[i].Value && eventCompareEnabled[i].Value;
             }
 
-            IRQ.Set(flag);
+            if(flag && !previousIrqState)
+            {
+                IRQ.Blink();
+            }
+            else if(!flag && previousIrqState)
+            {
+                IRQ.Unset();
+            }
+            previousIrqState = flag;
         }
 
         private IFlagRegisterField[] eventCompareInterruptEnabled;
         private IValueRegisterField prescaler;
         private IEnumRegisterField<Mode> mode;
+        private IEnumRegisterField<BitModeValue> bitMode;
+        private bool previousIrqState;
         private bool timerRunning;
 
         private readonly IFlagRegisterField[] eventCompareEnabled;
+        private readonly bool[] shortClearEnabled;
+        private readonly bool[] shortStopEnabled;
 
         private readonly ComparingTimer[] innerTimers;
 
@@ -254,6 +313,14 @@ namespace Antmicro.Renode.Peripherals.Timers
             Timer,
             Counter,
             LowPowerCounter
+        }
+
+        private enum BitModeValue
+        {
+            Bit16 = 0,
+            Bit8 = 1,
+            Bit24 = 2,
+            Bit32 = 3
         }
 
         private enum Register : long
