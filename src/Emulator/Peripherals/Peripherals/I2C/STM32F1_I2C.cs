@@ -17,6 +17,30 @@ using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.I2C
 {
+    // STM32F1/F4 I2C master controller.
+    //
+    // Master-receiver flow per RM0090 §27.3.3 (N > 2 bytes):
+    //
+    //   Firmware                   Model
+    //   ────────────────────────   ──────────────────────────────────
+    //   CR1 |= ACK | START        → SB=1, state=WriteAddress
+    //   poll SR1.SB               ← returns SB=1
+    //   DR = addr|1               → resolve slave, ADDR=1, state=ReadData
+    //                               initial child.Read(1) → data queue
+    //                               schedule UpdateDataReceive
+    //   poll SR1.ADDR             ← returns ADDR=1
+    //   read SR2                  → clears ADDR
+    //   ┌─ poll SR1.RXNE          ← returns rxDataNotEmpty
+    //   │  read DR                → dequeue byte from data
+    //   │                           schedule UpdateDataReceive
+    //   │  (scheduled action)     → child.Read(1) if ACK, enqueue to data
+    //   │                           set RXNE if data available
+    //   └─ repeat for each byte
+    //   CR1 &= ~ACK; CR1 |= STOP → state=LastRead (no more fetches)
+    //   poll SR1.RXNE             ← returns true (last byte in buffer)
+    //   read DR                   → dequeue last byte, FinishTransmission
+    //                               state=Idle
+
     public class STM32F1_I2C : SimpleContainer<II2CPeripheral>, IDoubleWordPeripheral, IWordPeripheral, IProvidesRegisterCollection<DoubleWordRegisterCollection>, IKnownSize
     {
         public STM32F1_I2C(IMachine machine) : base(machine)
@@ -104,7 +128,7 @@ namespace Antmicro.Renode.Peripherals.I2C
                 .WithTaggedFlag("NOSTRETCH", 7)
                 .WithFlag(8, out start, name: "START")
                 .WithFlag(9, out stop, name: "STOP")
-                .WithTaggedFlag("ACK", 10)
+                .WithFlag(10, out ack, name: "ACK")
                 .WithTaggedFlag("POS", 11)
                 .WithTaggedFlag("PEC", 12)
                 .WithTaggedFlag("ALERT", 13)
@@ -137,6 +161,9 @@ namespace Antmicro.Renode.Peripherals.I2C
                             }
                             else
                             {
+                                // Receive mode: transition to LastRead.
+                                // The firmware sets STOP before reading the final byte.
+                                // The actual stop is executed after that last DR read.
                                 dataState = DataState.LastRead;
                             }
                             mode.Value = Mode.Slave;
@@ -334,14 +361,29 @@ namespace Antmicro.Renode.Peripherals.I2C
             UpdateInterrupts();
         }
 
+        // Simulates one byte arriving from the slave on the I2C bus.
+        // Called at the I2C clock rate via the scheduled action, NOT
+        // from HandleDataRead — this ensures bytes are consumed from
+        // the DummyI2CSlave at the correct emulated I2C bus speed.
         private void UpdateDataReceive()
         {
             if(!rxDataNotEmpty.Value)
             {
-                this.NoisyLog("RxNE updated in scheduled action");
-                rxDataNotEmpty.Value = true;
+                // Fetch next byte from slave if the buffer is empty
+                // and the master still has ACK set (expects more data).
+                if(data.Count == 0 && child != null && ack.Value)
+                {
+                    data.EnqueueRange(child.Read(I2CReadCount));
+                    this.NoisyLog("Fetched byte from slave at clock rate");
+                }
+                rxDataNotEmpty.Value = data.Count > 0;
                 byteTransferFinished.Value = false;
-                QueueUpdate(UpdateDataReceive);
+
+                // Re-schedule to keep fetching while in receive mode
+                if(dataState == DataState.ReadData && ack.Value)
+                {
+                    QueueUpdate(UpdateDataReceive);
+                }
             }
             else if(dataState != DataState.LastRead)
             {
@@ -399,12 +441,16 @@ namespace Antmicro.Renode.Peripherals.I2C
                     else
                     {
                         dataState = DataState.ReadData;
-                        QueueUpdate(UpdateDataReceive);
-                        if(data.Count == 0)
+                        // Fetch the first byte immediately at address-match time
+                        // (simulates the slave responding to its address).
+                        if(child != null)
                         {
                             data.EnqueueRange(child.Read(I2CReadCount));
-                            this.DebugLog("Performed read from 0x{0:X}: {1}", address, Misc.PrettyPrintCollectionHex(data));
+                            this.DebugLog("Initial read from 0x{0:X}: {1}", address, Misc.PrettyPrintCollectionHex(data));
                         }
+                        // Schedule the clock-driven receive that will fetch
+                        // subsequent bytes at the I2C bus rate.
+                        QueueUpdate(UpdateDataReceive);
                     }
                     this.NoisyLog("Selected 0x{0:X} for {1}", address, dataDirection.Value == Direction.Transmit ? "write" : "read");
                     break;
@@ -421,14 +467,18 @@ namespace Antmicro.Renode.Peripherals.I2C
             }
         }
 
+        // Called when firmware reads the DR register.
+        // Per RM0090: reading DR clears RXNE.  The next RXNE is set
+        // by UpdateDataReceive when the next byte arrives on the bus.
         private byte HandleDataRead()
         {
             lock(updateLock)
             {
                 var result = (byte)0x0;
 
+                // Reading DR clears RXNE.  BTF indicates a second byte
+                // was already received while the first sat in DR.
                 rxDataNotEmpty.Value = byteTransferFinished.Value;
-                // Assume access after SR1 read
                 byteTransferFinished.Value = false;
 
                 switch(dataState)
@@ -436,12 +486,13 @@ namespace Antmicro.Renode.Peripherals.I2C
                 case DataState.LastRead:
                     if(rxDataNotEmpty.Value)
                     {
-                        // Not the last read yet, as the data register
-                        // hasn't been read before setting stop
+                        // BTF was set: firmware hasn't read the byte that
+                        // was already in DR when STOP was requested.
                         goto case DataState.ReadData;
                     }
+                    // Final byte: dequeue and finish the transaction.
                     UpdateSchedule(enable: false);
-                    result = PerformRead();
+                    result = DequeueOrZero();
                     child?.FinishTransmission();
                     if(mode.Value == Mode.Master)
                     {
@@ -457,7 +508,8 @@ namespace Antmicro.Renode.Peripherals.I2C
                     stop.Value = false;
                     break;
                 case DataState.ReadData:
-                    result = PerformRead();
+                    result = DequeueOrZero();
+                    // Schedule next byte fetch at the I2C clock rate
                     QueueUpdate(UpdateDataReceive);
                     break;
                 default:
@@ -469,21 +521,17 @@ namespace Antmicro.Renode.Peripherals.I2C
             }
         }
 
-        private byte PerformRead()
+        // Dequeue one byte from the internal buffer.  Never calls
+        // child.Read() — all slave reads go through UpdateDataReceive
+        // to enforce I2C clock-rate pacing.
+        private byte DequeueOrZero()
         {
             if(data.TryDequeue(out var b))
             {
                 return b;
             }
-            if(child == null)
-            {
-                this.DebugLog("Child not registered, returning 0x0");
-                return 0x0;
-            }
-
-            data.EnqueueRange(child.Read(I2CReadCount));
-            this.DebugLog("Performed read from 0x{0:X}: {1}", address, Misc.PrettyPrintCollectionHex(data));
-            return data.TryDequeue(out b) ? b : (byte)0x0;
+            this.DebugLog("Read with empty buffer, returning 0x0");
+            return 0x0;
         }
 
         private void UpdateIdle()
@@ -547,6 +595,7 @@ namespace Antmicro.Renode.Peripherals.I2C
         private IFlagRegisterField peripheralEnable;
         private IFlagRegisterField start;
         private IFlagRegisterField stop;
+        private IFlagRegisterField ack;
         private IValueRegisterField frequency;
         private IFlagRegisterField errorInterruptEnabled;
         private IFlagRegisterField eventInterruptEnable;
