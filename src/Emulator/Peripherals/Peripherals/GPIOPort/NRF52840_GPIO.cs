@@ -246,23 +246,23 @@ namespace Antmicro.Renode.Peripherals.GPIOPort
 
                 set
                 {
+                    var wasEverSet = everSet;
                     everSet = true;
 
                     if(Direction != PinDirection.Input)
                     {
-                        // buffer the value so that it can be used on a next direction change
                         bufferedInputValue = value;
                         return;
                     }
 
-                    if(value == Parent.State[Id])
+                    if(wasEverSet && value == Parent.State[Id])
                     {
                         return;
                     }
 
                     Parent.NoisyLog("Setting pin {0} input to {1}", Id, value);
                     Parent.State[Id] = value;
-                    Parent.PinChanged(this, value);
+                    Parent.PinChanged?.Invoke(this, value);
                     Parent.UpdateDetect();
                 }
             }
