@@ -4,11 +4,8 @@
 // This file is licensed under the MIT License.
 // Full license text is available in 'licenses/MIT.txt'.
 //
-
-// uncomment the line below to get more detailed logs
-// note: dumping packets may severely lower performance
-// #define DEBUG_PACKETS
-
+// BLE HCI Bridge for Renode — translates between BLEMedium IRadio frames
+// and HCI-H4 over TCP. allows VHCI programs to drive emulated BLE devices.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -61,6 +58,7 @@ namespace Antmicro.Renode.Extensions.Utilities.BLEHCI
 
         public void Reset()
         {
+            this.Log(LogLevel.Info, "Reset() called — returning to Standby");
             state = State.WaitForType;
             linkState = LinkState.Standby;
             currentPacketType = 0;
@@ -78,6 +76,7 @@ namespace Antmicro.Renode.Extensions.Utilities.BLEHCI
 
         public void ReceiveFrame(byte[] frame, IRadio sender)
         {
+            this.Log(LogLevel.Debug, "ReceiveFrame: {0} bytes, linkState={1}, channel={2}", frame.Length, linkState, Channel);
             switch(linkState)
             {
             case LinkState.Scanning:
@@ -102,11 +101,9 @@ namespace Antmicro.Renode.Extensions.Utilities.BLEHCI
 
         private void SendResponse(IEnumerable<byte> bytes)
         {
-            server.Send(bytes);
-
-#if DEBUG_PACKETS
-            this.Log(LogLevel.Noisy, "Count {0}: {1}", bytes.Count(), Misc.PrettyPrintCollectionHex(bytes));
-#endif
+            var arr = bytes.ToArray();
+            this.Log(LogLevel.Info, "HCI TX ({0} bytes): {1}", arr.Length, Misc.PrettyPrintCollectionHex(arr));
+            server.Send(arr);
         }
 
         private void Shutdown()
@@ -120,9 +117,7 @@ namespace Antmicro.Renode.Extensions.Utilities.BLEHCI
 
         private void HandleIncomingData(int b)
         {
-#if DEBUG_PACKETS
-            this.Log(LogLevel.Noisy, "Incoming byte: 0x{0:X}; state = {1}; buffer size = {2}", b, state, buffer.Count);
-#endif
+            this.Log(LogLevel.Debug, "HCI RX byte: 0x{0:X2}; state={1}; bufSz={2}", b, state, buffer.Count);
 
             if(b < 0)
             {
@@ -168,6 +163,13 @@ namespace Antmicro.Renode.Extensions.Utilities.BLEHCI
                     expectedLength = HCIACLHeaderLength + (buffer[3] | (buffer[4] << 8));
                     state = State.WaitForPayload;
                 }
+
+                // Handle zero-parameter commands: when paramLen == 0,
+                // buffer is already complete after the header.
+                if(state == State.WaitForPayload && buffer.Count >= expectedLength)
+                {
+                    goto case State.WaitForPayload;
+                }
                 break;
             }
 
@@ -209,7 +211,7 @@ namespace Antmicro.Renode.Extensions.Utilities.BLEHCI
                 Array.Copy(packet, 4, parameters, 0, paramLen);
             }
 
-            this.Log(LogLevel.Debug, "HCI Command: opcode=0x{0:X4}, paramLen={1}", opcode, paramLen);
+            this.Log(LogLevel.Info, "HCI Command received: opcode=0x{0:X4}, paramLen={1}", opcode, paramLen);
 
             switch(opcode)
             {
@@ -262,6 +264,21 @@ namespace Antmicro.Renode.Extensions.Utilities.BLEHCI
                 features[0] = 0x00;
                 features[5] |= 0x40; // LE Supported (Controller)
                 SendCommandComplete(opcode, features);
+                break;
+            }
+
+            case HCIOpcode.ReadLocalExtendedFeatures:
+            {
+                var pageNumber = parameters.Length >= 1 ? parameters[0] : (byte)0;
+                var resp = new byte[11];
+                resp[0] = 0x00;       // status
+                resp[1] = pageNumber; // page_number
+                resp[2] = 0x01;       // max_page_number
+                if(pageNumber == 0)
+                {
+                    resp[7] = 0x40;   // LE Supported (Controller)
+                }
+                SendCommandComplete(opcode, resp);
                 break;
             }
 
@@ -764,6 +781,7 @@ namespace Antmicro.Renode.Extensions.Utilities.BLEHCI
             public const ushort ReadLocalVersionInformation = 0x1001;
             public const ushort ReadLocalSupportedCommands = 0x1002;
             public const ushort ReadLocalSupportedFeatures = 0x1003;
+            public const ushort ReadLocalExtendedFeatures = 0x1004;
             public const ushort ReadBDAddr = 0x1009;
             public const ushort LESetEventMask = 0x2001;
             public const ushort LEReadBufferSize = 0x2002;
