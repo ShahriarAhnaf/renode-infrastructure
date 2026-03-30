@@ -1,4 +1,4 @@
-﻿//
+//
 // Copyright (c) 2010-2026 Antmicro
 //
 // This file is licensed under the MIT License.
@@ -144,9 +144,21 @@ namespace Antmicro.Renode.Peripherals.Timers
                     })
                     .WithReservedBits(1, 31)
                 },
+                {(long)Register.TriggerOverflow, new DoubleWordRegister(this)
+                    .WithFlag(0, FieldMode.Write, name: "TASKS_TRIGOVRFLW", writeCallback: (_, value) =>
+                    {
+                        if(value)
+                        {
+                            overflowEvent.Value = true;
+                            EventTriggered?.Invoke((uint)Register.Overflow);
+                            UpdateInterrupts();
+                        }
+                    })
+                    .WithReservedBits(1, 31)
+                },
                 {(long)Register.InterruptEnableSet, new DoubleWordRegister(this)
                     .WithFlag(0, out tickInterruptEnabled, FieldMode.Set | FieldMode.Read, name: "TICK")
-                    .WithTaggedFlag("OVRFLW", 1)
+                    .WithFlag(1, out overflowInterruptEnabled, FieldMode.Set | FieldMode.Read, name: "OVRFLW")
                     .WithReservedBits(2, 14)
                     .WithFlags(16, numberOfEvents, out compareInterruptEnabled, FieldMode.Set | FieldMode.Read, name: "COMPARE")
                     .WithChangeCallback((_, __) =>
@@ -159,7 +171,9 @@ namespace Antmicro.Renode.Peripherals.Timers
                     .WithFlag(0, name: "TICK",
                           writeCallback: (_, value) => tickInterruptEnabled.Value &= !value,
                           valueProviderCallback: _ => tickInterruptEnabled.Value)
-                    .WithTaggedFlag("OVRFLW", 1)
+                    .WithFlag(1, name: "OVRFLW",
+                          writeCallback: (_, value) => overflowInterruptEnabled.Value &= !value,
+                          valueProviderCallback: _ => overflowInterruptEnabled.Value)
                     .WithReservedBits(2, 14)
                     .WithFlags(16, numberOfEvents, name: "COMPARE",
                           writeCallback: (j, _, value) => compareInterruptEnabled[j].Value &= !value,
@@ -210,6 +224,11 @@ namespace Antmicro.Renode.Peripherals.Timers
                    .WithFlag(0, out tickEvent, name: "EVENTS_TICK")
                    .WithReservedBits(1, 31)
                    .WithWriteCallback((_, __) => UpdateInterrupts())
+                },
+                {(long)Register.Overflow, new DoubleWordRegister(this)
+                   .WithFlag(0, out overflowEvent, name: "EVENTS_OVRFLW")
+                   .WithReservedBits(1, 31)
+                   .WithWriteCallback((_, __) => UpdateInterrupts())
                 }
             };
 
@@ -258,6 +277,7 @@ namespace Antmicro.Renode.Peripherals.Timers
             }
 
             flag |= tickEvent.Value && tickInterruptEnabled.Value;
+            flag |= overflowEvent.Value && overflowInterruptEnabled.Value;
             IRQ.Set(flag);
         }
 
@@ -265,6 +285,8 @@ namespace Antmicro.Renode.Peripherals.Timers
         private IValueRegisterField prescaler;
         private IFlagRegisterField tickInterruptEnabled;
         private IFlagRegisterField tickEvent;
+        private IFlagRegisterField overflowInterruptEnabled;
+        private IFlagRegisterField overflowEvent;
 
         private DoubleWordRegisterCollection registers;
         private IFlagRegisterField[] compareEventEnabled;
