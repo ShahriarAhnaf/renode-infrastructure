@@ -387,6 +387,11 @@ namespace Antmicro.Renode.Peripherals.UART
             {
                 this.Log(LogLevel.Warning, "No characters in queue.");
             }
+            if(Count > 0 && receiveDmaEnabled.Value)
+            {
+                ReceiveDmaRequest.Set(false);
+                ReceiveDmaRequest.Set(true);
+            }
             return result;
         }
 
