@@ -214,7 +214,7 @@ namespace Antmicro.Renode.Peripherals.DMA
                                 DoTransfer();
                             }
                         },
-                        valueProviderCallback: _ => false, name: "Channel enable (EN)")
+                        name: "Channel enable (EN)")
                     .WithFlag(1, out transferCompleteInterruptEnable, name: "Transfer complete interrupt enable (TCIE)")
                     .WithFlag(2, out halfTransferInterruptEnable, name: "Half transfer interrupt enable (HTIE)")
                     .WithTag("Transfer error interrupt enable (TEIE)", 3, 1)
