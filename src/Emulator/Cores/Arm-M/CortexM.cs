@@ -883,6 +883,12 @@ namespace Antmicro.Renode.Peripherals.CPU
         }
 
         [Export]
+        private int AnyPendingEnabledIRQ()
+        {
+            return nvic.AnyPendingEnabledInterrupt ? 1 : 0;
+        }
+
+        [Export]
         private void OnBASEPRIWrite(int value, uint secure)
         {
             if(secure > 0)

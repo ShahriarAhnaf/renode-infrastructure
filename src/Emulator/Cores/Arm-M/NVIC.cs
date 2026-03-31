@@ -622,6 +622,24 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
 
         public bool MaskedInterruptPresent { get { return maskedInterruptPresent; } }
 
+        public bool AnyPendingEnabledInterrupt
+        {
+            get
+            {
+                lock(irqs)
+                {
+                    foreach(var i in pendingIRQs)
+                    {
+                        if((irqs[i] & IRQState.Enabled) != 0 && (irqs[i] & IRQState.Pending) != 0)
+                        {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            }
+        }
+
         public bool PauseInsteadOfReset { get; set; }
 
         public ulong Frequency
@@ -1017,6 +1035,19 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
              * If there is an address here, it's always valid */
             Registers.SecureFaultAddress.Define(RegisterCollection)
                 .WithValueField(0, 32, FieldMode.Read, valueProviderCallback: _ => isNextAccessSecure ? cpu.SecureFaultAddress : 0, name: "Address");
+
+            Registers.DebugHaltingControlStatus.Define(RegisterCollection)
+                .WithFlag(0, FieldMode.Read, valueProviderCallback: _ => false, name: "C_DEBUGEN")
+                .WithFlag(1, FieldMode.Read, valueProviderCallback: _ => false, name: "C_HALT")
+                .WithReservedBits(2, 14)
+                .WithFlag(16, FieldMode.Read, valueProviderCallback: _ => false, name: "S_REGRDY")
+                .WithFlag(17, FieldMode.Read, valueProviderCallback: _ => false, name: "S_HALT")
+                .WithFlag(18, FieldMode.Read, valueProviderCallback: _ => false, name: "S_SLEEP")
+                .WithFlag(19, FieldMode.Read, valueProviderCallback: _ => false, name: "S_LOCKUP")
+                .WithReservedBits(20, 4)
+                .WithFlag(24, FieldMode.Read, valueProviderCallback: _ => false, name: "S_RETIRE_ST")
+                .WithFlag(25, FieldMode.Read, valueProviderCallback: _ => false, name: "S_RESET_ST")
+                .WithReservedBits(26, 6);
         }
 
         private void DefineTightlyCoupledMemoryControlRegisters()
@@ -2109,6 +2140,7 @@ namespace Antmicro.Renode.Peripherals.IRQControllers
             SAURegionLimitAddress = 0xDE0, // SAU_RLAR
             SecureFaultStatus = 0xDE4, // SAU_SFSR
             SecureFaultAddress = 0xDE8, // SAU_SFAR
+            DebugHaltingControlStatus = 0xDF0, // DHCSR
             DebugExceptionAndMonitorControlRegister = 0xDFC, // DEMCR
             SoftwareTriggerInterrupt = 0xF00, // STIR
             FPContextControl = 0xF34, // FPCCR
