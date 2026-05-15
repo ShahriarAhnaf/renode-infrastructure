@@ -25,6 +25,8 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         public override void Reset()
         {
             base.Reset();
+            started = false;
+            previousIrqState = false;
             IRQ.Unset();
         }
 
@@ -37,26 +39,41 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
         private void DefineRegisters()
         {
             Registers.Start.Define(this)
-                .WithFlag(0, out started, FieldMode.Write, name: "TASKS_START")
+                .WithFlag(0, FieldMode.Write, writeCallback: (_, value) =>
+                {
+                    if(value)
+                    {
+                        started = true;
+                        eventValrdy.Value = true;
+                    }
+                }, name: "TASKS_START")
                 .WithReservedBits(1, 31)
                 .WithWriteCallback((_, __) => Update())
             ;
 
             Registers.Stop.Define(this)
-                .WithFlag(0, FieldMode.Write, writeCallback: (_, value) => started.Value &= !value, name: "TASKS_STOP")
+                .WithFlag(0, FieldMode.Write, writeCallback: (_, value) => { if(value) started = false; }, name: "TASKS_STOP")
                 .WithReservedBits(1, 31)
                 .WithWriteCallback((_, __) => Update())
             ;
 
             Registers.ValueReady.Define(this)
-                .WithFlag(0, writeCallback: (_, value) =>
+                .WithFlag(0, out eventValrdy, writeCallback: (_, value) =>
                 {
                     if(!value)
                     {
-                        IRQ.Unset();
+                        // Firmware cleared the event after consuming a byte.
+                        // Real hardware re-fires VALRDY automatically on the
+                        // next byte; this model used to fire only once per
+                        // TASKS_START, starving the Zephyr entropy pool. Re-arm
+                        // immediately whenever still started.
+                        if(started)
+                        {
+                            eventValrdy.Value = true;
+                        }
+                        Update();
                     }
-                    Update();
-                }, valueProviderCallback: _ => started.Value, name: "EVENTS_VALRDY")
+                }, name: "EVENTS_VALRDY")
                 .WithReservedBits(1, 31)
             ;
 
@@ -84,28 +101,38 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             ;
 
             Registers.Value.Define(this, name: "VALUE")
-                .WithValueField(0, 8, FieldMode.Read, valueProviderCallback: _ => started.Value ? (uint)rng.Next(0, byte.MaxValue) : 0u, name: "VALUE")
+                .WithValueField(0, 8, FieldMode.Read, valueProviderCallback: _ => started ? (uint)rng.Next(0, byte.MaxValue) : 0u, name: "VALUE")
                 .WithReservedBits(8, 24)
             ;
         }
 
         private void Update()
         {
-            var value = started.Value && interruptEnabled.Value;
-            if(value)
+            var irqCondition = eventValrdy.Value && interruptEnabled.Value;
+            // Edge-trigger on rising; also re-pulse if we're still asserting
+            // and previousIrqState is true — this matches the hardware
+            // semantic where VALRDY auto-rearms after each consumed byte.
+            if(irqCondition)
             {
                 this.Log(LogLevel.Noisy, "Generated new interrupt for RNG");
                 EventTriggered?.Invoke(0);
+                IRQ.Blink();
             }
-            IRQ.Set(value);
-            if(started.Value && readyToStopShortEnabled.Value)
+            else if(!irqCondition && previousIrqState)
             {
-                started.Value = false;
-                IRQ.Set(false);
+                IRQ.Unset();
+            }
+            previousIrqState = irqCondition;
+
+            if(eventValrdy.Value && readyToStopShortEnabled.Value)
+            {
+                started = false;
             }
         }
 
-        private IFlagRegisterField started;
+        private bool previousIrqState;
+        private bool started;
+        private IFlagRegisterField eventValrdy;
         private IFlagRegisterField readyToStopShortEnabled;
         private IFlagRegisterField interruptEnabled;
 
