@@ -325,15 +325,15 @@ namespace Antmicro.Renode.Core.USB
                 }
                 if(packet.Direction == Direction.DeviceToHost)
                 {
-                    core.HandleEp0SetupPacket(packet, null, res =>
-                    {
-                        readBuffer.Enqueue(res);
-                        NewPacket?.Invoke();
-                    });
+                    core.HandleEp0SetupPacket(packet, null, Enqueue);
                 }
                 else if(packet.Count == 0)
                 {
                     core.HandleEp0SetupPacket(packet, null);
+                    // A request with no data stage is acknowledged by a zero-length IN packet;
+                    // without it the host side of `SetupWrite` waits forever for a status stage
+                    // that never arrives
+                    Enqueue(new byte[] { });
                 }
                 else
                 {
@@ -350,6 +350,8 @@ namespace Antmicro.Renode.Core.USB
                 }
                 core.HandleEp0SetupPacket(pendingPacket.Value, data);
                 pendingPacket = null;
+                // status stage of a host-to-device transfer - see above
+                Enqueue(new byte[] { });
             }
 
             public void SetupWrite(SetupPacket packet, byte[] data)
@@ -363,6 +365,12 @@ namespace Antmicro.Renode.Core.USB
             }
 
             public event Action NewPacket;
+
+            private void Enqueue(byte[] data)
+            {
+                readBuffer.Enqueue(data);
+                NewPacket?.Invoke();
+            }
 
             private SetupPacket? pendingPacket;
 
